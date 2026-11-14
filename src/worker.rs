@@ -21,6 +21,10 @@ const RECONNECT_CHECK: Duration = Duration::from_secs(30);
 const RECONNECT_CHECK_OBSERVED: Duration = Duration::from_secs(5);
 /// Polling interval cap while the Dashboard is open.
 const OBSERVED_POLL: Duration = Duration::from_secs(10);
+/// Longest time a connected device goes without a link check, so a mouse switched off without
+/// notice stops showing live values within a minute (TRAY-07). One cheap query; it does not wake
+/// a sleeping Razer mouse (M1 finding).
+const LINK_CHECK: Duration = Duration::from_secs(60);
 const LISTEN_SLICE_MS: u32 = 200;
 /// Retry delay after a timeout or busy answer.
 const TRANSIENT_RETRY: Duration = Duration::from_secs(5);
@@ -256,9 +260,12 @@ impl Worker {
     }
 
     fn interval(&self, c: &CapabilityDescriptor) -> Option<Duration> {
-        let base = Duration::from_secs(c.poll_interval_s? as u64).max(Duration::from_secs(
+        let mut base = Duration::from_secs(c.poll_interval_s? as u64).max(Duration::from_secs(
             self.hub.settings().poll_interval_seconds as u64,
         ));
+        if c.id == cap::LINK_STATE {
+            base = base.min(LINK_CHECK);
+        }
         Some(if self.hub.has_observers() {
             base.min(OBSERVED_POLL)
         } else {
@@ -355,6 +362,20 @@ impl Worker {
 
     fn poll_due(&mut self) -> Step {
         let now = Instant::now();
+        // An observer arrived: bring schedules made without one forward.
+        if self.hub.has_observers() {
+            let cap_at = now
+                + if self.connected {
+                    OBSERVED_POLL
+                } else {
+                    RECONNECT_CHECK_OBSERVED
+                };
+            for t in self.due.values_mut() {
+                if *t > cap_at {
+                    *t = cap_at;
+                }
+            }
+        }
         let due: Vec<String> = self
             .due
             .iter()

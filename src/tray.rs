@@ -6,9 +6,10 @@ use std::sync::Arc;
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use winit::application::ApplicationHandler;
+use winit::dpi::LogicalSize;
 use winit::event::{StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::window::WindowId;
+use winit::window::{Window, WindowId};
 
 #[derive(Debug, Clone)]
 pub enum UserEvent {
@@ -26,6 +27,13 @@ pub fn proxy_and_loop() -> (EventLoop<UserEvent>, EventLoopProxy<UserEvent>) {
     (event_loop, proxy)
 }
 
+/// The settings panel (APP-08): a WebView2 window showing the Dashboard's `#/panel` view, so the
+/// settings UI exists once. Closing it destroys the WebView and its processes.
+struct Panel {
+    window: Window,
+    _webview: wry::WebView,
+}
+
 struct App {
     hub: Arc<Hub>,
     api: Arc<ApiState>,
@@ -35,6 +43,8 @@ struct App {
     quit_id: MenuId,
     shown: (Option<(u8, bool, bool)>, Vec<String>),
     open_at_start: bool,
+    panel: Option<Panel>,
+    web_context: wry::WebContext,
 }
 
 impl App {
@@ -106,6 +116,46 @@ impl App {
             tracing::warn!("cannot open the browser: {e}");
         }
     }
+
+    fn open_panel(&mut self, el: &ActiveEventLoop) {
+        if let Some(p) = &self.panel {
+            p.window.set_minimized(false);
+            p.window.focus_window();
+            return;
+        }
+        let title = if self.english() {
+            "WaiShe Settings"
+        } else {
+            "WaiShe 设置"
+        };
+        let attrs = Window::default_attributes()
+            .with_title(title)
+            .with_inner_size(LogicalSize::new(400.0, 640.0))
+            .with_resizable(false);
+        let window = match el.create_window(attrs) {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::warn!("settings window unavailable ({e}); using the browser");
+                return self.open("#/panel");
+            }
+        };
+        let url = self.api.sign_in_url("#/panel");
+        match wry::WebViewBuilder::new_with_web_context(&mut self.web_context)
+            .with_url(url)
+            .build(&window)
+        {
+            Ok(webview) => {
+                self.panel = Some(Panel {
+                    window,
+                    _webview: webview,
+                })
+            }
+            Err(e) => {
+                tracing::warn!("WebView2 unavailable ({e}); using the browser");
+                self.open("#/panel");
+            }
+        }
+    }
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -132,16 +182,23 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn resumed(&mut self, _: &ActiveEventLoop) {}
 
-    fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, _: WindowEvent) {}
+    fn window_event(&mut self, _: &ActiveEventLoop, id: WindowId, e: WindowEvent) {
+        if matches!(e, WindowEvent::CloseRequested)
+            && self.panel.as_ref().is_some_and(|p| p.window.id() == id)
+        {
+            self.panel = None;
+        }
+    }
 
     fn user_event(&mut self, el: &ActiveEventLoop, e: UserEvent) {
         match e {
             UserEvent::Changed => self.refresh(),
             UserEvent::Show => self.open(""),
             UserEvent::Menu(m) if m.id == self.open_id => self.open(""),
-            UserEvent::Menu(m) if m.id == self.panel_id => self.open("#/panel"),
+            UserEvent::Menu(m) if m.id == self.panel_id => self.open_panel(el),
             UserEvent::Menu(m) if m.id == self.quit_id => {
                 tracing::info!("quit from tray");
+                self.panel = None;
                 self.tray = None;
                 el.exit();
             }
@@ -157,6 +214,7 @@ pub fn run(
     hub: Arc<Hub>,
     api: Arc<ApiState>,
     open_at_start: bool,
+    webview_data: std::path::PathBuf,
 ) {
     MenuEvent::set_event_handler(Some(move |e| {
         let _ = proxy.send_event(UserEvent::Menu(e));
@@ -170,6 +228,8 @@ pub fn run(
         quit_id: MenuId::new("quit"),
         shown: (None, Vec::new()),
         open_at_start,
+        panel: None,
+        web_context: wry::WebContext::new(Some(webview_data)),
     };
     if let Err(e) = event_loop.run_app(&mut app) {
         tracing::error!("event loop: {e}");

@@ -9,6 +9,8 @@ pub struct Paths {
     pub devices: PathBuf,
     pub drivers: PathBuf,
     pub logs: PathBuf,
+    /// WebView2 user data of the settings panel.
+    pub webview: PathBuf,
 }
 
 impl Paths {
@@ -32,6 +34,7 @@ impl Paths {
             devices: config.join("devices.json"),
             drivers: data.join("drivers"),
             logs: data.join("logs"),
+            webview: data.join("webview"),
         };
         for dir in [&config, &p.drivers, &p.logs] {
             let _ = std::fs::create_dir_all(dir);

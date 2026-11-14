@@ -32,6 +32,8 @@ open = "5.4.5"
 tray-icon = { version = "0.26.1", default-features = false }
 winit = "0.30.13"
 tauri-winrt-notification = "0.8.1"
+# Settings panel window (APP-08): WebView2, which Windows 11 ships with.
+wry = { version = "0.57.2", default-features = false }
 winreg = "0.56.0"
 windows-sys = { version = "0.61.2", features = [
   "Win32_Foundation",

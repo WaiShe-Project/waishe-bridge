@@ -122,7 +122,7 @@ Dashboard 与 Bridge 之间的接口。Dashboard 由 Bridge 同源提供，只�
 ```
 
 - `trust`：`official`、`community`、`local`。M1 只有 `local`。
-- `status`：`active`（已启用，正在服务或等待设备）、`disabled`（用户禁用）、`faulted`（连续故障后自动禁用，原因见 `fault`）。
+- `status`：`active`（已启用，正在服务或等待设备）、`disabled`（用户禁用）、`faulted`（连续故障后自动禁用，原因见 `fault`，为字符串；其他状态下 `fault` 为 `null`）。
 
 ### 3.6 设置 `Settings`
 
@@ -140,12 +140,13 @@ Dashboard 与 Bridge 之间的接口。Dashboard 由 Bridge 同源提供，只�
 
 - `language`：`zh-CN` 或 `en`。
 - `tray.mode`：`lowest`（显示电量最低的设备，充电中的设备不参与）或 `device`（显示 `deviceId` 指定的设备）。
+- 取值范围：`lowBattery.threshold` 5–95，`lowBattery.intervalMinutes` 1–1440，`pollIntervalSeconds` 30–3600。超出时返回 422 `invalid_settings`。
 
 ## 4. 接口
 
 | 方法与路径 | 请求 | 成功响应 |
 | --- | --- | --- |
-| `GET /status` | — | `{ "version", "apiVersion": "0.1", "driverAbi": "0.1", "platform", "port", "vendorSoftware": ["Razer Synapse"] }` |
+| `GET /status` | — | `{ "version", "apiVersion": "0.1", "driverAbi": "0.1", "platform", "port", "vendorSoftware": [{ "name": "Razer Synapse", "brand": "Razer" }] }`。`vendorSoftware` 是正在运行、可能与 Bridge 同时操作设备的厂商软件，`brand` 与 `Device.brand` 对应 |
 | `GET /devices` | — | `Device[]` |
 | `GET /devices/{id}` | — | `Device` |
 | `PATCH /devices/{id}` | `{ "alias"?: string \| null, "hidden"?: bool }` | `Device` |
@@ -179,6 +180,10 @@ Content-Type: application/json
 | `accepted` | 200 | 设备确认，无法回读 |
 | `rejected` | 422 | 参数不满足约束，或设备拒绝；`message` 说明原因 |
 | `failed` | 502 | 通信错误或超时；`reading` 为随后重新读取的结果 |
+
+- 所有写入结果都带 `reading`，即写入后的当前读数。参数类型错误、能力不存在或不可写等不属于写入结果的情况，使用第 7 节的错误格式。
+- `range` 约束的步进从 `min` 起算。
+- 设备处于 `asleep` 时也可以写入，由驱动决定结果。
 
 Dashboard 不做乐观更新，以响应为准。
 

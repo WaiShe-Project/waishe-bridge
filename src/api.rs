@@ -167,12 +167,13 @@ async fn asset(uri: Uri) -> Response {
 
 // ---------------------------------------------------------------- status
 
-fn vendor_software() -> Vec<&'static str> {
+/// Known vendor software that may send commands to the same devices (CFG-04): (exe, name, brand).
+fn vendor_software() -> Vec<(&'static str, &'static str)> {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::*;
-    const KNOWN: &[(&str, &str)] = &[
-        ("razerappengine.exe", "Razer Synapse"),
-        ("ngenuity.exe", "HyperX NGENUITY"),
+    const KNOWN: &[(&str, &str, &str)] = &[
+        ("razerappengine.exe", "Razer Synapse", "Razer"),
+        ("ngenuity.exe", "HyperX NGENUITY", "HyperX"),
     ];
     let mut found = Vec::new();
     unsafe {
@@ -190,10 +191,10 @@ fn vendor_software() -> Vec<&'static str> {
                 .position(|&c| c == 0)
                 .unwrap_or(e.szExeFile.len());
             let name = String::from_utf16_lossy(&e.szExeFile[..len]).to_lowercase();
-            if let Some((_, label)) = KNOWN.iter().find(|(exe, _)| *exe == name)
-                && !found.contains(label)
+            if let Some((_, label, brand)) = KNOWN.iter().find(|(exe, _, _)| *exe == name)
+                && !found.iter().any(|(l, _)| l == label)
             {
-                found.push(*label);
+                found.push((*label, *brand));
             }
             ok = Process32NextW(snap, &mut e) != 0;
         }
@@ -212,7 +213,7 @@ async fn status(State(s): State<Shared>) -> Json<Json_> {
         "driverAbi": format!("{}.{}", waishe_driver_types::abi::VERSION_MAJOR, waishe_driver_types::abi::VERSION_MINOR),
         "platform": "windows-x64",
         "port": s.port,
-        "vendorSoftware": vendors,
+        "vendorSoftware": vendors.iter().map(|(name, brand)| json!({ "name": name, "brand": brand })).collect::<Vec<_>>(),
     }))
 }
 

@@ -137,7 +137,14 @@ fn main() {
             let _ = p.send_event(tray::UserEvent::Show);
         });
     }
-    tray::run(event_loop, proxy, hub, api, !background);
+    tray::run(
+        event_loop,
+        proxy,
+        hub,
+        api,
+        !background,
+        paths.webview.clone(),
+    );
 
     manager.shutdown();
     let _ = manager_thread.join();
