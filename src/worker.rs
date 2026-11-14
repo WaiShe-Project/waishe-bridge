@@ -85,6 +85,9 @@ struct Worker {
     /// Capabilities whose last read was a timeout or busy answer; read again soon.
     retry: std::collections::HashSet<String>,
     connected: bool,
+    /// A link event brought the device back; everything is read again on the next poll. Set by
+    /// `drain_input`, which cannot read itself because every read drains input.
+    reread: bool,
 }
 
 enum Step {
@@ -159,6 +162,7 @@ impl Worker {
                 listen: probe.listen.clone(),
                 due: HashMap::new(),
                 connected: true,
+                reread: false,
                 retry: Default::default(),
             };
             let step = w.serve(&rx);
@@ -309,6 +313,7 @@ impl Worker {
     }
 
     fn read_all(&mut self) -> Step {
+        self.reread = false;
         let ids: Vec<String> = self
             .caps
             .iter()
@@ -361,6 +366,11 @@ impl Worker {
     }
 
     fn poll_due(&mut self) -> Step {
+        // Capabilities marked disconnected while the device was away, and those without a poll
+        // interval (mic mute), have no schedule left: read everything once it is back.
+        if self.reread && self.connected {
+            return self.read_all();
+        }
         let now = Instant::now();
         // An observer arrived: bring schedules made without one forward.
         if self.hub.has_observers() {
@@ -436,8 +446,7 @@ impl Worker {
                             if !now_connected {
                                 self.mark_disconnected();
                             } else if !was {
-                                // Came back: read everything once more after the event batch.
-                                self.due.insert(cap::LINK_STATE.into(), Instant::now());
+                                self.reread = true;
                             }
                         } else {
                             self.hub
