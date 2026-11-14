@@ -2,7 +2,7 @@
 
 WaiShe 的本地常驻程序：发现外设、运行驱动、在后台监控电量、提供系统托盘与通知，并为 Web Dashboard 提供本地 API。
 
-**当前阶段：规划。尚无代码和发行版。** 首发平台为 Windows。
+**当前阶段：M1 完成（2026-11-14），尚未公开发布。** 平台为 Windows 11 x64。
 
 ## 职责
 
@@ -48,13 +48,47 @@ Bridge 是登录用户会话内的普通进程。托盘图标和系统通知需�
 
 | 文档 | 内容 | 状态 |
 | --- | --- | --- |
-| [本地 API](docs/local-api.md) | Dashboard 与 Bridge 之间的接口 | 草案 0.1 |
+| [本地 API](docs/local-api.md) | Dashboard 与 Bridge 之间的接口 | 0.1，已实现 |
 
 项目级的需求、架构、路线图与决策记录在 `waishe` 仓库的 `docs/` 下。驱动接口在 `waishe-driver-sdk` 仓库。
 
-## 技术方向
+## 构建与运行
 
-倾向使用 Rust。具体依赖在 M0 技术验证中确定，验证项见 `waishe` 仓库的路线图：设备可达性、插件运行时、托盘与通知、同源 Dashboard 与鉴权、设备归并。
+需要 Rust（MSVC 工具链）。
+
+```powershell
+cargo build                      # 调试版；不含 Dashboard 时内嵌一个占位页面
+.\target\debug\waishe-bridge.exe # 启动并打开 Dashboard
+```
+
+命令行参数：
+
+| 参数 | 作用 |
+| --- | --- |
+| `--background` | 只在托盘启动（开机自启使用） |
+| `--install-driver <文件.wsdrv>` | 安装本地驱动包后退出 |
+
+环境变量：
+
+| 变量 | 作用 |
+| --- | --- |
+| `WAISHE_BRIDGE_HOME` | 把设置、驱动、日志都放到该目录下（开发与测试） |
+| `WAISHE_LOG` | 日志过滤，例如 `info,waishe_bridge=debug` |
+| `WAISHE_DEV_SIGNIN` | 仅调试版：把一次性登录地址写入该文件，供脚本测试本地 API |
+
+发布安装包：同一父目录下需有 `waishe` 仓库，并安装 Node.js 与 Inno Setup 7，然后运行
+
+```powershell
+.\scripts\build-release.ps1
+```
+
+产物为 `target\installer\WaiShe-Setup-<版本>-x64.exe` 及其 SHA-256。安装包按当前用户安装，不需要管理员权限，不包含任何驱动。
+
+用户数据位置：设置在 `%APPDATA%\WaiShe\Bridge\config`，驱动、日志与设置面板的 WebView2 数据在 `%LOCALAPPDATA%\WaiShe\Bridge\data`。日志按天滚动，保留 7 天，不记录 HID 报文与序列号。
+
+## 技术选型
+
+Rust；驱动由 wasmi 运行（`waishe` 仓库决策记录 0003）；本地 API 用 axum；托盘用 tray-icon 与 winit；设置面板用 wry（WebView2，决策记录 0005）；HID 用 hidapi 的 Windows 原生后端，设备归并与插拔通知直接调用 Windows 配置管理器接口。
 
 ## 许可证
 
