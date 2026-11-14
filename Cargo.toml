@@ -1,6 +1,6 @@
 [package]
 name = "waishe-bridge"
-version = "0.1.2"
+version = "0.1.6"
 edition = "2024"
 rust-version = "1.90"
 license = "MIT OR Apache-2.0"
@@ -43,6 +43,7 @@ windows-sys = { version = "0.61.2", features = [
   "Win32_Devices_HumanInterfaceDevice",
   "Win32_System_Threading",
   "Win32_System_Diagnostics_ToolHelp",
+  "Win32_UI_WindowsAndMessaging",
 ] }
 
 [build-dependencies]

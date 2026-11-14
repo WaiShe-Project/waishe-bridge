@@ -141,12 +141,65 @@ pub enum Event {
     Settings,
 }
 
-/// What the tray shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrayIconStyle {
+    Battery,
+    Brand,
+}
+
+/// Five-tier battery fill level (`0..=5`) per WaiShe tray icon specification section 2.1.
+pub fn battery_tier(percent: u8) -> u8 {
+    match percent {
+        0 => 0,
+        1..=20 => 1,
+        21..=40 => 2,
+        41..=60 => 3,
+        61..=80 => 4,
+        _ => 5,
+    }
+}
+
+/// Primary tray visual state ordered by specification section 5 priority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrayVisualState {
+    Error,
+    Disconnected,
+    Unknown,
+    CriticalLow { tier: u8 },
+    Charging { tier: u8 },
+    Low { tier: u8 },
+    Normal { tier: u8 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrayAlertLevel {
+    CriticalLow,
+    Low,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeviceTrayStatus {
+    Disconnected,
+    Error,
+    Unknown,
+    Valid { percent: u8, charging: bool },
+}
+
+#[derive(Debug, Clone)]
+struct TrayDeviceSnapshot {
+    id: DeviceId,
+    name: String,
+    hidden: bool,
+    status: DeviceTrayStatus,
+}
+
+/// Resolved tray icon appearance and single-line tooltip.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TraySummary {
-    /// Battery to draw on the icon: (percent, charging, stale).
-    pub icon: Option<(u8, bool, bool)>,
-    /// One line per visible device.
-    pub lines: Vec<String>,
+    pub style: TrayIconStyle,
+    pub state: TrayVisualState,
+    pub target_device_id: Option<String>,
+    pub tooltip: String,
 }
 
 #[derive(Default)]
@@ -160,6 +213,7 @@ struct Inner {
     settings: Settings,
     overrides: DeviceOverrides,
     low_battery: BTreeMap<DeviceId, LowBatteryState>,
+    tray_alerts: BTreeMap<DeviceId, TrayAlertLevel>,
 }
 
 type Callback = Box<dyn Fn() + Send + Sync>;
@@ -285,6 +339,7 @@ impl Hub {
                 settings,
                 overrides,
                 low_battery: BTreeMap::new(),
+                tray_alerts: BTreeMap::new(),
             }),
             events: broadcast::channel(256).0,
             observers: AtomicUsize::new(0),
@@ -620,53 +675,292 @@ impl Hub {
     }
 
     pub fn tray_summary(&self) -> TraySummary {
-        let g = self.inner.lock().unwrap();
-        let mut lines = Vec::new();
-        let mut candidates = Vec::new();
-        for d in g.devices.values() {
-            let o = g.overrides.get(&d.id);
-            if o.is_some_and(|o| o.hidden) {
-                continue;
-            }
-            let name = o
-                .and_then(|o| o.alias.clone())
-                .unwrap_or_else(|| d.name.clone());
-            let live = d.link() == Link::Connected;
-            let battery = d.reading_value(cap::BATTERY_LEVEL).and_then(|v| {
-                if let Value::Percent(p) = v {
-                    Some(*p)
-                } else {
-                    None
+        let mut g = self.inner.lock().unwrap();
+        let snapshots: Vec<TrayDeviceSnapshot> = g
+            .devices
+            .values()
+            .map(|d| {
+                let o = g.overrides.get(&d.id);
+                let hidden = o.is_some_and(|o| o.hidden);
+                let name = o
+                    .and_then(|o| o.alias.clone())
+                    .unwrap_or_else(|| d.name.clone());
+                let status = evaluate_device_tray_status(d, &g.settings);
+                TrayDeviceSnapshot {
+                    id: d.id.clone(),
+                    name,
+                    hidden,
+                    status,
                 }
-            });
-            let stale = !live || is_stale(d, cap::BATTERY_LEVEL, &g.settings);
-            let state = match (battery, live) {
-                (Some(p), true) if d.is_charging() => format!("{p}% · 充电中"),
-                (Some(p), true) if !stale => format!("{p}%"),
-                (Some(p), _) => format!("{p}%（历史值）"),
-                (None, true) => "已连接".into(),
-                (None, false) => "未连接".into(),
-            };
-            let state = if d.link() == Link::Connected || battery.is_some() {
-                state
+            })
+            .collect();
+        let settings = g.settings.clone();
+        resolve_tray_summary(&snapshots, &settings, &mut g.tray_alerts)
+    }
+}
+
+fn evaluate_device_tray_status(d: &Device, settings: &Settings) -> DeviceTrayStatus {
+    match d.link() {
+        Link::Disconnected => return DeviceTrayStatus::Disconnected,
+        Link::Asleep | Link::Unknown => return DeviceTrayStatus::Unknown,
+        Link::Connected => {}
+    }
+
+    let Some(r) = d.readings.get(cap::BATTERY_LEVEL) else {
+        return DeviceTrayStatus::Unknown;
+    };
+    match &r.state {
+        State::Ok(Value::Percent(p)) => {
+            if is_stale(d, cap::BATTERY_LEVEL, settings) {
+                DeviceTrayStatus::Unknown
             } else {
-                "未连接".into()
-            };
-            lines.push(format!("{name}：{state}"));
-            if let Some(p) = battery {
-                candidates.push((d.id.clone(), p, d.is_charging(), stale));
+                DeviceTrayStatus::Valid {
+                    percent: *p,
+                    charging: d.is_charging(),
+                }
             }
         }
-        let icon = match (g.settings.tray.mode.as_str(), &g.settings.tray.device_id) {
-            ("device", Some(id)) => candidates.iter().find(|c| &c.0 == id),
-            _ => candidates
-                .iter()
-                .filter(|c| !c.2 && !c.3)
-                .min_by_key(|c| c.1)
-                .or_else(|| candidates.iter().min_by_key(|c| c.1)),
+        State::Unavailable(why) if matches!(*why, "protocol" | "io") => {
+            if has_fresh_last_ok(d, r, settings) {
+                DeviceTrayStatus::Unknown
+            } else {
+                DeviceTrayStatus::Error
+            }
         }
-        .map(|c| (c.1, c.2, c.3));
-        TraySummary { icon, lines }
+        State::Unavailable(_) | State::Unknown | State::Ok(_) => DeviceTrayStatus::Unknown,
+    }
+}
+
+fn has_fresh_last_ok(d: &Device, r: &Reading, settings: &Settings) -> bool {
+    let Some((_, t)) = r.last_ok else {
+        return false;
+    };
+    let Some(c) = d.caps.iter().find(|c| c.id == cap::BATTERY_LEVEL) else {
+        return false;
+    };
+    match poll_seconds(c, settings) {
+        Some(p) => t.elapsed().unwrap_or_default() <= Duration::from_secs(p * 12 / 5),
+        None => false,
+    }
+}
+
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    let mut chars = s.chars();
+    let prefix: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_none() {
+        prefix
+    } else if max_chars > 1 {
+        let trimmed: String = s.chars().take(max_chars - 1).collect();
+        format!("{trimmed}…")
+    } else {
+        "…".into()
+    }
+}
+
+fn classify_valid_battery(
+    device_id: &str,
+    percent: u8,
+    charging: bool,
+    threshold: u8,
+    alerts: &mut BTreeMap<DeviceId, TrayAlertLevel>,
+) -> TrayVisualState {
+    let tier = battery_tier(percent);
+    if charging {
+        alerts.remove(device_id);
+        return TrayVisualState::Charging { tier };
+    }
+
+    let prev = alerts.get(device_id).copied();
+    let critical = percent <= 10 || (prev == Some(TrayAlertLevel::CriticalLow) && percent <= 12);
+    if critical {
+        alerts.insert(device_id.to_string(), TrayAlertLevel::CriticalLow);
+        return TrayVisualState::CriticalLow { tier };
+    }
+
+    let low_exit = threshold.saturating_add(2).min(98);
+    let low = percent <= threshold || (prev == Some(TrayAlertLevel::Low) && percent <= low_exit);
+    if low {
+        alerts.insert(device_id.to_string(), TrayAlertLevel::Low);
+        return TrayVisualState::Low { tier };
+    }
+
+    alerts.remove(device_id);
+    TrayVisualState::Normal { tier }
+}
+
+fn resolve_tray_summary(
+    snapshots: &[TrayDeviceSnapshot],
+    settings: &Settings,
+    alerts: &mut BTreeMap<DeviceId, TrayAlertLevel>,
+) -> TraySummary {
+    let style = match settings.tray.style.as_str() {
+        "brand" => TrayIconStyle::Brand,
+        _ => TrayIconStyle::Battery,
+    };
+    let en = settings.language == "en";
+    let threshold = settings.low_battery.threshold;
+
+    let (state, target_device_id, raw_tooltip) =
+        if settings.tray.mode == "device"
+            && let Some(pinned_id) = settings.tray.device_id.as_deref()
+        {
+            match snapshots.iter().find(|s| s.id == pinned_id) {
+                None => (
+                    TrayVisualState::Disconnected,
+                    Some(pinned_id.to_string()),
+                    if en {
+                        "WaiShe · Pinned device unavailable".into()
+                    } else {
+                        "WaiShe · 指定设备不可用".into()
+                    },
+                ),
+                Some(dev) => {
+                    let name = truncate_chars(&dev.name, 36);
+                    match dev.status {
+                        DeviceTrayStatus::Disconnected => (
+                            TrayVisualState::Disconnected,
+                            Some(dev.id.clone()),
+                            if en {
+                                format!("WaiShe · {name} · Disconnected")
+                            } else {
+                                format!("WaiShe · {name} · 已断开")
+                            },
+                        ),
+                        DeviceTrayStatus::Error => (
+                            TrayVisualState::Error,
+                            Some(dev.id.clone()),
+                            if en {
+                                format!("WaiShe · {name} · Driver error")
+                            } else {
+                                format!("WaiShe · {name} · 驱动监控异常")
+                            },
+                        ),
+                        DeviceTrayStatus::Unknown => (
+                            TrayVisualState::Unknown,
+                            Some(dev.id.clone()),
+                            if en {
+                                format!("WaiShe · {name} · Battery unavailable")
+                            } else {
+                                format!("WaiShe · {name} · 电量暂不可用")
+                            },
+                        ),
+                        DeviceTrayStatus::Valid { percent, charging } => {
+                            let st = classify_valid_battery(
+                                &dev.id, percent, charging, threshold, alerts,
+                            );
+                            let status_text = match st {
+                                TrayVisualState::Charging { .. } => {
+                                    if en { "Charging" } else { "充电中" }
+                                }
+                                TrayVisualState::CriticalLow { .. } => {
+                                    if en { "Critically low" } else { "严重低电量" }
+                                }
+                                TrayVisualState::Low { .. } => {
+                                    if en { "Low battery" } else { "低电量" }
+                                }
+                                _ => {
+                                    if en { "Not charging" } else { "未充电" }
+                                }
+                            };
+                            (
+                                st,
+                                Some(dev.id.clone()),
+                                format!("WaiShe · {name} · {percent}% · {status_text}"),
+                            )
+                        }
+                    }
+                }
+            }
+        } else {
+            let visible: Vec<&TrayDeviceSnapshot> =
+                snapshots.iter().filter(|s| !s.hidden).collect();
+            let chosen_valid = visible
+                .iter()
+                .filter_map(|s| match s.status {
+                    DeviceTrayStatus::Valid {
+                        percent,
+                        charging: false,
+                    } => Some((s, percent, false)),
+                    _ => None,
+                })
+                .min_by_key(|(_, pct, _)| *pct)
+                .or_else(|| {
+                    visible
+                        .iter()
+                        .filter_map(|s| match s.status {
+                            DeviceTrayStatus::Valid {
+                                percent,
+                                charging: true,
+                            } => Some((s, percent, true)),
+                            _ => None,
+                        })
+                        .min_by_key(|(_, pct, _)| *pct)
+                });
+
+            if let Some((dev, percent, charging)) = chosen_valid {
+                let name = truncate_chars(&dev.name, 36);
+                let st =
+                    classify_valid_battery(&dev.id, percent, charging, threshold, alerts);
+                let tip = match (en, charging) {
+                    (true, true) => format!("WaiShe · Lowest: {name} · {percent}% · Charging"),
+                    (true, false) => format!("WaiShe · Lowest: {name} · {percent}%"),
+                    (false, true) => format!("WaiShe · 最低电量：{name} · {percent}% · 充电中"),
+                    (false, false) => format!("WaiShe · 最低电量：{name} · {percent}%"),
+                };
+                (st, Some(dev.id.clone()), tip)
+            } else if let Some(err_dev) = visible
+                .iter()
+                .find(|s| s.status == DeviceTrayStatus::Error)
+            {
+                let name = truncate_chars(&err_dev.name, 36);
+                (
+                    TrayVisualState::Error,
+                    Some(err_dev.id.clone()),
+                    if en {
+                        format!("WaiShe · {name} · Driver error")
+                    } else {
+                        format!("WaiShe · {name} · 驱动监控异常")
+                    },
+                )
+            } else if let Some(unk_dev) = visible
+                .iter()
+                .find(|s| s.status == DeviceTrayStatus::Unknown)
+            {
+                let name = truncate_chars(&unk_dev.name, 36);
+                (
+                    TrayVisualState::Unknown,
+                    Some(unk_dev.id.clone()),
+                    if en {
+                        format!("WaiShe · {name} · Battery unavailable")
+                    } else {
+                        format!("WaiShe · {name} · 电量暂不可用")
+                    },
+                )
+            } else if visible
+                .iter()
+                .any(|s| s.status == DeviceTrayStatus::Disconnected)
+            {
+                (
+                    TrayVisualState::Disconnected,
+                    None,
+                    if en {
+                        "WaiShe · Devices disconnected".into()
+                    } else {
+                        "WaiShe · 设备已断开".into()
+                    },
+                )
+            } else {
+                (TrayVisualState::Unknown, None, "WaiShe".into())
+            }
+        };
+
+    // Windows native tray tooltips are bounded at 127 UTF-16 code units.
+    let tooltip = truncate_chars(&raw_tooltip, 127);
+    TraySummary {
+        style,
+        state,
+        target_device_id,
+        tooltip,
     }
 }
 
@@ -894,6 +1188,198 @@ mod tests {
         assert_eq!(
             value_json(&Value::Dpi { x: 1, y: 2 }),
             json!({ "x": 1, "y": 2 })
+        );
+    }
+
+    fn snap(id: &str, name: &str, status: DeviceTrayStatus) -> TrayDeviceSnapshot {
+        TrayDeviceSnapshot {
+            id: id.into(),
+            name: name.into(),
+            hidden: false,
+            status,
+        }
+    }
+
+    #[test]
+    fn battery_tier_matches_spec() {
+        assert_eq!(battery_tier(100), 5);
+        assert_eq!(battery_tier(87), 5);
+        assert_eq!(battery_tier(81), 5);
+        assert_eq!(battery_tier(80), 4);
+        assert_eq!(battery_tier(61), 4);
+        assert_eq!(battery_tier(60), 3);
+        assert_eq!(battery_tier(46), 3);
+        assert_eq!(battery_tier(41), 3);
+        assert_eq!(battery_tier(40), 2);
+        assert_eq!(battery_tier(21), 2);
+        assert_eq!(battery_tier(20), 1);
+        assert_eq!(battery_tier(1), 1);
+        assert_eq!(battery_tier(0), 0);
+    }
+
+    #[test]
+    fn tray_summary_lowest_prefers_non_charging_and_falls_back_to_charging() {
+        let s = Settings::default();
+        let mut alerts = BTreeMap::new();
+        let list = vec![
+            snap(
+                "dev_hyperx",
+                "HyperX Cloud III Wireless",
+                DeviceTrayStatus::Valid {
+                    percent: 18,
+                    charging: true,
+                },
+            ),
+            snap(
+                "dev_razer",
+                "Razer DeathAdder V3 Pro",
+                DeviceTrayStatus::Valid {
+                    percent: 86,
+                    charging: false,
+                },
+            ),
+        ];
+        let summary = resolve_tray_summary(&list, &s, &mut alerts);
+        assert_eq!(summary.style, TrayIconStyle::Battery);
+        assert_eq!(summary.state, TrayVisualState::Normal { tier: 5 });
+        assert_eq!(summary.target_device_id.as_deref(), Some("dev_razer"));
+        assert!(summary.tooltip.contains("Razer DeathAdder V3 Pro"));
+        assert!(summary.tooltip.contains("86%"));
+
+        // When all valid devices are charging, pick the lowest charging device.
+        let charging_only = vec![
+            snap(
+                "dev_a",
+                "Mouse A",
+                DeviceTrayStatus::Valid {
+                    percent: 45,
+                    charging: true,
+                },
+            ),
+            snap(
+                "dev_b",
+                "Headset B",
+                DeviceTrayStatus::Valid {
+                    percent: 15,
+                    charging: true,
+                },
+            ),
+        ];
+        let summary2 = resolve_tray_summary(&charging_only, &s, &mut alerts);
+        assert_eq!(summary2.state, TrayVisualState::Charging { tier: 1 });
+        assert_eq!(summary2.target_device_id.as_deref(), Some("dev_b"));
+    }
+
+    #[test]
+    fn tray_summary_pinned_device_does_not_fallback_when_disconnected() {
+        let mut s = Settings::default();
+        s.tray.mode = "device".into();
+        s.tray.device_id = Some("dev_razer".into());
+        let mut alerts = BTreeMap::new();
+        let list = vec![
+            snap(
+                "dev_hyperx",
+                "HyperX Cloud III Wireless",
+                DeviceTrayStatus::Valid {
+                    percent: 47,
+                    charging: false,
+                },
+            ),
+            snap(
+                "dev_razer",
+                "Razer DeathAdder V3 Pro",
+                DeviceTrayStatus::Disconnected,
+            ),
+        ];
+        let summary = resolve_tray_summary(&list, &s, &mut alerts);
+        assert_eq!(summary.state, TrayVisualState::Disconnected);
+        assert_eq!(summary.target_device_id.as_deref(), Some("dev_razer"));
+        assert!(summary.tooltip.contains("已断开"));
+    }
+
+    #[test]
+    fn tray_summary_distinguishes_unknown_and_zero_and_stabilizes_equal_battery() {
+        let s = Settings::default();
+        let mut alerts = BTreeMap::new();
+
+        // Unknown / stale battery must be Unknown, never CriticalLow/Empty 0%.
+        let unk = vec![snap(
+            "dev_mouse",
+            "Mouse",
+            DeviceTrayStatus::Unknown,
+        )];
+        let summary_unk = resolve_tray_summary(&unk, &s, &mut alerts);
+        assert_eq!(summary_unk.state, TrayVisualState::Unknown);
+        assert!(summary_unk.tooltip.contains("电量暂不可用"));
+
+        // Equal battery percentages select deterministically without oscillation.
+        let equal = vec![
+            snap(
+                "dev_a",
+                "Device A",
+                DeviceTrayStatus::Valid {
+                    percent: 50,
+                    charging: false,
+                },
+            ),
+            snap(
+                "dev_b",
+                "Device B",
+                DeviceTrayStatus::Valid {
+                    percent: 50,
+                    charging: false,
+                },
+            ),
+        ];
+        let sum1 = resolve_tray_summary(&equal, &s, &mut alerts);
+        let sum2 = resolve_tray_summary(&equal, &s, &mut alerts);
+        assert_eq!(sum1.target_device_id, sum2.target_device_id);
+        assert_eq!(sum1.target_device_id.as_deref(), Some("dev_a"));
+    }
+
+    #[test]
+    fn tray_summary_hysteresis_prevents_boundary_flicker() {
+        let s = Settings::default(); // low threshold = 20
+        let mut alerts = BTreeMap::new();
+
+        let at_20 = vec![snap(
+            "dev_a",
+            "Mouse",
+            DeviceTrayStatus::Valid {
+                percent: 20,
+                charging: false,
+            },
+        )];
+        assert_eq!(
+            resolve_tray_summary(&at_20, &s, &mut alerts).state,
+            TrayVisualState::Low { tier: 1 }
+        );
+
+        // Fluctuating up by 1% to 21% stays Low until above threshold + 2 (23%).
+        let at_21 = vec![snap(
+            "dev_a",
+            "Mouse",
+            DeviceTrayStatus::Valid {
+                percent: 21,
+                charging: false,
+            },
+        )];
+        assert_eq!(
+            resolve_tray_summary(&at_21, &s, &mut alerts).state,
+            TrayVisualState::Low { tier: 2 }
+        );
+
+        let at_23 = vec![snap(
+            "dev_a",
+            "Mouse",
+            DeviceTrayStatus::Valid {
+                percent: 23,
+                charging: false,
+            },
+        )];
+        assert_eq!(
+            resolve_tray_summary(&at_23, &s, &mut alerts).state,
+            TrayVisualState::Normal { tier: 2 }
         );
     }
 }

@@ -20,6 +20,8 @@ pub struct Settings {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct TraySettings {
+    /// `battery` (default) or `brand`.
+    pub style: String,
     /// `lowest` or `device`.
     pub mode: String,
     pub device_id: Option<String>,
@@ -57,6 +59,7 @@ impl Default for Settings {
 impl Default for TraySettings {
     fn default() -> Self {
         TraySettings {
+            style: "battery".into(),
             mode: "lowest".into(),
             device_id: None,
         }
@@ -86,6 +89,9 @@ impl Settings {
     fn validate(&self) -> Result<(), String> {
         if !["zh-CN", "en"].contains(&self.language.as_str()) {
             return Err("language must be zh-CN or en".into());
+        }
+        if !["battery", "brand"].contains(&self.tray.style.as_str()) {
+            return Err("tray.style must be battery or brand".into());
         }
         if !["lowest", "device"].contains(&self.tray.mode.as_str()) {
             return Err("tray.mode must be lowest or device".into());
@@ -184,6 +190,15 @@ mod tests {
         );
         assert!(
             s.patched(&serde_json::json!({ "tray": { "mode": "biggest" } }))
+                .is_err()
+        );
+        assert_eq!(s.tray.style, "battery");
+        let brand = s
+            .patched(&serde_json::json!({ "tray": { "style": "brand" } }))
+            .unwrap();
+        assert_eq!(brand.tray.style, "brand");
+        assert!(
+            s.patched(&serde_json::json!({ "tray": { "style": "gauge" } }))
                 .is_err()
         );
     }
